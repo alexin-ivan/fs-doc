@@ -49,3 +49,145 @@ Lustre использует менеджера распределённой бл
 
 Lustre MDS конфигурируются как активная/пассивная пара, а OSS обычно развертываются в конфигурации активный/активный, обеспечивающей надежность без существенной перегрузки. Часто резервный MDS является активным MDS для другой файловой системы Lustre, поэтому в кластере нет простаивающих узлов.
 
+
+## Пример создания простейшего кластера на базе Lustre
+
+### Установка системы
+
+Вначале необходимо настроить 3-5 виртуалок (под `MGT`, `MDT` и `OST's` и клиент).
+На текущий момент проще всего поставить в качестве операционной системы `CentOS 7` (ядро 3.10):
+
+```bash
+[root@centos7-lustre-1 ~]# uname -a
+Linux centos7-lustre-1 3.10.0-327.el7.x86_64 #1 SMP Thu Nov 19 22:10:57 UTC 2015 x86_64 x86_64 x86_64 GNU/Linux
+```
+
+Систему можно ставить с дефолтными настройками, только лишь надо будет добавить `epel` для доступа к дополнительным пакетам.
+
+Теперь надо поставить ZFS. Установка zfs на `rpm`-образные дистрибутивы описана в офф. вики ZoL:
+
+```bash
+yum localinstall –nogpgcheck http://archive.zfsonlinux.org/epel/zfs-release$(rpm -E %dist).noarch.rpm
+yum check-update
+yum install zfs
+```
+
+Там также отмечено, что есть два типа пакетов - kmod и dkms. Лучше выбирать dkms.
+Это может пригодиться, если у вас будет устанавливаться пропатченное ядро (но в данном случае мы этого делать не будем).
+Кроме того, стоит отметить, что в данной версии бытые ссылки на хидеры. Необходимо добиться, чтобы содержимое `/usr/src`
+выглядело так:
+
+```bash
+[root@centos7-lustre-1 ~]# ll /usr/src/
+итого 12
+drwxr-xr-x.  2 root root    6 авг 12  2015 debug
+drwxr-xr-x.  3 root root   67 авг 16 06:09 kernels
+drwxr-xr-x  11 root root 4096 авг 16 06:33 lustre-2.8.0
+drwxr-xr-x. 10 root root 4096 авг 16 06:09 spl-0.6.5.7
+drwxr-xr-x  13 root root 4096 авг 16 06:29 zfs-0.6.5.7
+[root@centos7-lustre-1 ~]# ll /usr/src/kernels/
+итого 4
+drwxr-xr-x. 22 root root 4096 авг 16 06:07 3.10.0-327.28.2.el7.x86_64
+lrwxrwxrwx   1 root root   43 авг 16 06:09 3.10.0-327.el7.x86_64 -> /usr/src/kernels/3.10.0-327.28.2.el7.x86_64
+```
+
+То есть необходимо вручную добавить ссылку `3.10.0-327.el7.x86_64 -> /usr/src/kernels/3.10.0-327.28.2.el7.x86_64` в `/usr/src/kernels`.
+Возможно, есть и другой способ заставить работать `dkms`.
+
+Итак, для пользователя ставим `libzfs*` (который в качестве зависимостей тянет `libnvpair*`, `libuutil*` и другие).
+Для ядра необходимо поставить `zfs-dkms` и `spl-dkms`.
+
+После того, как `dkms`-модули `ZFS` и `SPL` установятся, можно приступить к установке самой `Lustre`.
+
+Вначале создадим файл `/etc/yum.repos.d/lustre.repo` со следующим содержимым:
+
+```conf
+[lustre-server]
+name=CentOS-$releasever - Lustre
+baseurl=https://downloads.hpdd.intel.com/public/lustre/latest-feature-release/el7/server/
+gpgcheck=0
+
+[e2fsprogs]
+name=CentOS-$releasever - Ldiskfs
+baseurl=https://downloads.hpdd.intel.com/public/e2fsprogs/latest/el7/RPMS
+gpgcheck=0
+
+[lustre-client]
+name=CentOS-$releasever - Lustre
+baseurl=https://downloads.hpdd.intel.com/public/lustre/latest-feature-release/el7/client/
+gpgcheck=0
+```
+
+Затем нам необходимо установить компоненты lustre, в том числе и lustre-dkms.
+
+
+### Настройка системы
+
+Теперь необходимо прописать конфиги в `/etc/ldev.conf` и скопировать их на все машины. Например:
+
+```bash
+[root@centos7-lustre-1 ~]# cat /etc/ldev.conf 
+#local  foreign/-  label       [md|zfs:]device-path   [journal-path]/- [raidtab]
+#1.              2. 3.      4.
+centos7-lustre-1 -- mgs     zfs:warp-mgt0/mgt0
+centos7-lustre-1 -- mdt     zfs:warp-mdt0/mdt0
+centos7-lustre-2 -- ost0    zfs:warp-ost0/ost0
+```
+
+Где показаны:
+
+1. Имя хоста на котором должно находиться хранилище
+
+2. Имя запасного хоста (куда надо реплицировать данные, в моём случае `"--"`, т.е. нет реплики).
+
+3. Тип хранилища.
+
+4. Имя датасета, на который хранит данные (`<type>:<pool>/<dataset>`).
+
+Теперь сделаем несколько клонов этой машины.
+
+### Создание ФС
+
+Вначале создаём MGT-хранилище:
+
+```
+mkfs.lustre --mgs --backfstype=zfs warp-mgt0/mgt0 /tmp/lustre.file
+```
+
+Затем - MDT:
+
+```
+IP=172.16.8.140 # mgs ip
+mkfs.lustre --mdt --backfstype=zfs --index=0  --mgsnode=${IP}@tcp --fsname warpfs warp-mdt0/mdt0 /tmp/mdt0.file
+```
+
+Стоит отметить, что хранилища могут размещаться на разных нодах и на разных пулах. Могут и на одном и том же пуле одной ноды.
+Пулы также можно создавать любым образом.
+
+Теперь можно запустить сервис `lustre`. Стоит отметить, что в примере пулы создаются поверх файлов, так что рестарт сервиса несработает,
+так как нужно будет вручную импортировать пулы.
+
+```
+service lustre start
+```
+
+Теперь создаём OST-хранилище (здесь будут лежать данные). Создаём его на соседней ноде:
+
+```bash
+IP=172.16.8.140 # mgs ip
+mkfs.lustre --ost --backfstype=zfs --index=0 --mgsnode=${IP}@tcp --fsname warpfs warp-ost0/ost0 /tmp/lustre.file
+```
+
+На каждой ноде после `mkfs` выполняем запуск сервиса `lustre`.
+
+
+### Монтирование ФС
+
+Монтирование ФС `Lustre` можно выполнить следующим образом:
+
+```bash
+IP=172.16.8.140 # mgs ip
+mount -t lustre ${IP}@tcp:/warpfs /warpfs
+```
+
+
